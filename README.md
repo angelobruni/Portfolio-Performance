@@ -14,7 +14,7 @@ Implementation of the Black-Litterman asset allocation framework, translating ma
 - |------|--------------------------------|
 - | India > Japan | +3% p.a. |
 - | Healthcare > MSCI World Quality | +2% p.a. |
-- | Euro IG Bonds > US Treasuries ! +1.5% p.a. |
+- | Euro IG Bonds > US Treasuries | +1.5% p.a. |
 - | Infrastructure (absolute) | +8% p.a. |
 
 - ## Asset Universe
@@ -33,4 +33,4 @@ Implementation of the Black-Litterman asset allocation framework, translating ma
  
   - ## Related
   - Monthly Market Insight letter: https://medium.com/@angelobruni60
-LinkedIn: https://www.linkedin.com/in/angelobruni
+  - LinkedIn: https://www.linkedin.com/in/angelobruni
