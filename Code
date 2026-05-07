@@ -1,0 +1,485 @@
+# Portfolio Construction — Black-Litterman Model
+**Author:** Angelo Bruni  
+**Description:** Implementation of the Black-Litterman model incorporating macro views from the Monthly Market Insight letter (March 2026). This approach solves the concentration problem of classic Markowitz by blending market equilibrium returns with the portfolio manager's active views.
+
+---
+## Why Black-Litterman over Markowitz?
+
+| Issue with Markowitz | Black-Litterman Solution |
+|---|---|
+| Extreme concentration in few assets | Starts from diversified market equilibrium |
+| Highly sensitive to return estimates | Blends estimates with market implied returns |
+| No room for manager views | Explicitly incorporates forward-looking views |
+| Unstable weights across periods | More stable, intuitive allocations |
+
+---
+## 1. Libraries
+# !pip install yfinance scipy matplotlib seaborn pandas numpy
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+import yfinance as yf
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use('seaborn-v0_8-darkgrid')
+print('Libraries loaded.')
+## 2. Asset Universe
+
+The universe reflects the macro views from the Market Insight letter:
+
+| Asset | Ticker | Rationale |
+|---|---|---|
+| MSCI World Quality ETF | IWQU.L | Quality bias over pure growth |
+| Healthcare ETF (US) | XLV | AI-driven drug discovery, indirect AI beneficiary |
+| Industrials/Robotics ETF | IRBO | Automation & robotics structural trend |
+| Infrastructure ETF | IGF | Real assets, AI energy infrastructure |
+| India ETF | NDIA.L | Young demographics, digitalization, long-term growth |
+| Japan ETF | EWJ | Emerging from stagnation, domestic demand |
+| Euro IG Corporate Bonds | IEAC.L | Overweight euro duration, IG over HY |
+| US Treasury 7-10Y | IEF | Fixed income restoring role in portfolio |
+| Gold | GLD | Geopolitical hedge, inflation protection |
+| Energy ETF | XLE | Oil price spike from Middle East tensions |
+# Asset universe mapped to macro views
+ASSETS = {
+    'IWQU.L':  'MSCI World Quality',
+    'XLV':     'Healthcare',
+    'IRBO':    'Robotics & Automation',
+    'IGF':     'Infrastructure',
+    'NDIA.L':  'India',
+    'EWJ':     'Japan',
+    'IEAC.L':  'Euro IG Bonds',
+    'IEF':     'US Treasuries 7-10Y',
+    'GLD':     'Gold',
+    'XLE':     'Energy'
+}
+
+TICKERS   = list(ASSETS.keys())
+LABELS    = list(ASSETS.values())
+START     = '2020-01-01'
+END       = '2026-02-28'
+RF        = 0.045   # risk-free rate (annualised)
+TRADING_DAYS = 252
+
+raw = yf.download(TICKERS, start=START, end=END, auto_adjust=True)['Close']
+raw.dropna(axis=1, how='all', inplace=True)
+raw.dropna(how='any', inplace=True)
+
+# Remap to readable labels for any tickers that downloaded
+available = raw.columns.tolist()
+label_map = {t: ASSETS[t] for t in available if t in ASSETS}
+raw.rename(columns=label_map, inplace=True)
+
+print(f'Assets available: {raw.shape[1]} / {len(TICKERS)}')
+print(f'Observations: {raw.shape[0]} trading days')
+raw.tail(3)
+## 3. Returns & Covariance
+returns = np.log(raw / raw.shift(1)).dropna()
+n = returns.shape[1]
+asset_names = returns.columns.tolist()
+
+mu_hist   = returns.mean() * TRADING_DAYS          # historical annualised returns
+Sigma     = returns.cov()  * TRADING_DAYS          # annualised covariance matrix
+
+# Descriptive stats
+stats = pd.DataFrame({
+    'Return (%)':     (mu_hist * 100).round(2),
+    'Volatility (%)': (np.sqrt(np.diag(Sigma)) * 100).round(2),
+    'Sharpe':         ((mu_hist - RF) / np.sqrt(np.diag(Sigma))).round(2)
+})
+print(stats.sort_values('Sharpe', ascending=False))
+fig, ax = plt.subplots(figsize=(10, 8))
+corr = returns.corr()
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='RdYlGn',
+            center=0, vmin=-1, vmax=1, ax=ax, linewidths=0.5)
+ax.set_title('Asset Correlation Matrix', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('correlation_heatmap.png', dpi=150)
+plt.show()
+## 4. Step 1 — Market Equilibrium Returns (Prior)
+
+Black-Litterman starts from **market-implied equilibrium returns** (the "prior"), not historical returns. These are derived by reverse-engineering the market portfolio via:
+
+$$\Pi = \delta \cdot \Sigma \cdot w_{mkt}$$
+
+Where:
+- $\delta$ = market risk aversion coefficient (typically ~2.5)
+- $\Sigma$ = covariance matrix
+- $w_{mkt}$ = **AUM-based market cap weights** — proportional to ETF assets under management
+
+### Why AUM weights instead of equal weights?
+Equal weighting is a naive prior that ignores the information embedded in market prices. AUM reflects the collective allocation of global investors across these asset classes and is the standard approach used by institutional managers. For heterogeneous asset classes (equities, bonds, commodities), AUM is the most consistent common denominator available without building a full global market portfolio.
+delta = 2.5  # market risk aversion
+Sigma_np = Sigma.values
+
+# --- AUM-based market cap weights (USD billions, as of early 2025) ---
+# Source: ETF provider fact sheets (iShares, State Street, VanEck)
+# These reflect the relative size of each asset class in the portfolio universe
+AUM_RAW = {
+    'MSCI World Quality':   45.0,   # iShares MSCI World Quality Factor
+    'Healthcare':           40.0,   # SPDR S&P Healthcare Select
+    'Robotics & Automation': 2.5,   # iShares Robotics & AI (smaller, niche)
+    'Infrastructure':       5.0,    # iShares Global Infrastructure
+    'India':                8.0,    # Global X India ETF
+    'Japan':               12.0,    # iShares MSCI Japan
+    'Euro IG Bonds':       10.0,    # iShares Euro Corporate Bond
+    'US Treasuries 7-10Y': 35.0,    # iShares 7-10Y Treasury Bond
+    'Gold':                60.0,    # SPDR Gold Shares — largest gold ETF
+    'Energy':              40.0,    # SPDR S&P Energy Select
+}
+
+# Align AUM to available assets and normalise to sum to 1
+aum_values = np.array([AUM_RAW.get(a, 1.0) for a in asset_names])
+w_mkt = aum_values / aum_values.sum()
+
+# Print weights for transparency
+w_mkt_series = pd.Series(w_mkt, index=asset_names, name='Market Weight')
+print('AUM-based market weights:')
+print((w_mkt_series * 100).round(2).to_string())
+
+# Equilibrium (implied) returns
+Pi = delta * Sigma_np @ w_mkt
+
+Pi_series = pd.Series(Pi, index=asset_names, name='Equilibrium Return')
+print('\nMarket Equilibrium Returns (annualised):')
+print((Pi_series * 100).round(2).to_string())
+## 5. Step 2 — Investor Views (from Market Insight Letter)
+
+This is the core of Black-Litterman: we translate the macro views from the Market Insight letter into **quantitative view vectors**.
+
+| # | View from the letter | Direction |
+|---|---|---|
+| 1 | India outperforms Japan (both favoured, India stronger long-term) | India > Japan +3% |
+| 2 | Healthcare outperforms pure AI/Tech (indirect AI beneficiary) | Healthcare > World Quality +2% |
+| 3 | Euro IG Bonds outperform US Treasuries (overweight euro duration) | Euro IG > US Treasuries +1.5% |
+| 4 | Infrastructure delivers positive absolute return (AI energy capex) | Infrastructure absolute +8% |
+
+> **Note on Gold and Energy**: Both assets are held in the portfolio but carry no active view. Their allocation is driven entirely by the AUM-based prior — reflecting market sizing without imposing a directional signal.
+def idx(name):
+    """Return index of asset by name."""
+    return asset_names.index(name)
+
+# Check which assets are available
+print('Available assets:')
+for i, a in enumerate(asset_names):
+    print(f'  [{i}] {a}')
+# P matrix: each row = one view
+# +1 = long side of view, -1 = short side, 0 = not in view
+# Q vector: expected return differential for each view
+
+views = []
+
+# VIEW 1: India outperforms Japan by 3% per year
+# Letter: India favoured for young demographics and digitalisation;
+# Japan also positive but shorter-term catalyst vs India's structural story
+if 'India' in asset_names and 'Japan' in asset_names:
+    p1 = np.zeros(n)
+    p1[idx('India')]  =  1
+    p1[idx('Japan')]  = -1
+    views.append((p1, 0.03, 'India outperforms Japan by 3%'))
+
+# VIEW 2: Healthcare outperforms MSCI World Quality by 2%
+# Letter: Healthcare flagged as indirect AI beneficiary via drug discovery;
+# preference for quality with tangible earnings over pure growth
+if 'Healthcare' in asset_names and 'MSCI World Quality' in asset_names:
+    p2 = np.zeros(n)
+    p2[idx('Healthcare')]         =  1
+    p2[idx('MSCI World Quality')] = -1
+    views.append((p2, 0.02, 'Healthcare outperforms World Quality by 2%'))
+
+# VIEW 3: Euro IG Bonds outperform US Treasuries by 1.5%
+# Letter: Overweight euro duration explicitly stated; IG preferred over HY
+if 'Euro IG Bonds' in asset_names and 'US Treasuries 7-10Y' in asset_names:
+    p3 = np.zeros(n)
+    p3[idx('Euro IG Bonds')]       =  1
+    p3[idx('US Treasuries 7-10Y')] = -1
+    views.append((p3, 0.015, 'Euro IG outperforms US Treasuries by 1.5%'))
+
+# VIEW 4: Infrastructure delivers 8% absolute return
+# Letter: AI energy capex and real asset demand as structural tailwinds
+if 'Infrastructure' in asset_names:
+    p4 = np.zeros(n)
+    p4[idx('Infrastructure')] = 1
+    views.append((p4, 0.08, 'Infrastructure absolute return = 8%'))
+
+# NOTE: Gold and Energy carry no active view — allocation driven purely by AUM prior
+
+k = len(views)
+P = np.array([v[0] for v in views])
+Q = np.array([v[1] for v in views])
+
+print(f'{k} views loaded:')
+for i, (_, q, desc) in enumerate(views):
+    print(f'  View {i+1}: {desc}')
+## 6. Step 3 — Black-Litterman Posterior Returns
+
+The BL formula blends the prior $\Pi$ with the views $Q$ via:
+
+$$\mu_{BL} = \left[(\tau\Sigma)^{-1} + P^T\Omega^{-1}P\right]^{-1}\left[(\tau\Sigma)^{-1}\Pi + P^T\Omega^{-1}Q\right]$$
+
+Where $\tau$ controls how much weight we give to the prior, and $\Omega$ is the uncertainty in our views.
+tau = 0.075  # tau raised to 0.075: views carry meaningful weight (BlackRock range: 0.05-0.10)
+
+# Omega: diagonal uncertainty matrix for views
+# Using proportional-to-variance approach (He & Litterman standard)
+Omega = np.diag([tau * (P[i] @ Sigma_np @ P[i]) for i in range(k)])
+
+# Black-Litterman posterior formula
+tauSigma_inv = np.linalg.inv(tau * Sigma_np)
+Omega_inv    = np.linalg.inv(Omega)
+
+M1 = tauSigma_inv + P.T @ Omega_inv @ P
+M2 = tauSigma_inv @ Pi + P.T @ Omega_inv @ Q
+
+mu_BL = np.linalg.inv(M1) @ M2
+mu_BL_series = pd.Series(mu_BL, index=asset_names, name='BL Return')
+
+# Comparison: historical vs equilibrium vs BL
+comparison = pd.DataFrame({
+    'Historical (%)':    (mu_hist * 100).round(2),
+    'Equilibrium (%)':   (Pi_series * 100).round(2),
+    'Black-Litterman (%)': (mu_BL_series * 100).round(2)
+})
+print(comparison)
+# Visualise the return adjustment from BL views
+diff = (mu_BL_series - Pi_series) * 100
+colors = ['#2ecc71' if x > 0 else '#e74c3c' for x in diff]
+
+fig, ax = plt.subplots(figsize=(10, 5))
+bars = ax.barh(asset_names, diff, color=colors, edgecolor='white', linewidth=0.5)
+ax.axvline(0, color='white', linewidth=1)
+ax.set_xlabel('Return adjustment from views (%, annualised)', fontsize=11)
+ax.set_title('Black-Litterman: Return Adjustments vs Market Equilibrium', fontsize=13, fontweight='bold')
+for bar, val in zip(bars, diff):
+    ax.text(val + (0.05 if val >= 0 else -0.05), bar.get_y() + bar.get_height()/2,
+            f'{val:+.2f}%', va='center', ha='left' if val >= 0 else 'right', fontsize=9)
+plt.tight_layout()
+plt.savefig('bl_adjustments.png', dpi=150)
+plt.show()
+## 7. Step 4 — Portfolio Optimisation on BL Returns
+def port_ret(w): return w @ mu_BL
+def port_vol(w): return np.sqrt(w @ Sigma_np @ w)
+def neg_sharpe_bl(w): return -(port_ret(w) - RF) / port_vol(w)
+
+constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+# Long-only with max 25% per asset (diversification constraint)
+bounds = tuple((0.0, 0.25) for _ in range(n))
+w0 = np.array([1/n] * n)
+
+# Max Sharpe on BL returns
+res = minimize(neg_sharpe_bl, w0, method='SLSQP',
+               bounds=bounds, constraints=constraints)
+w_bl = res.x
+
+# Min Variance
+res_mv = minimize(port_vol, w0, method='SLSQP',
+                  bounds=bounds, constraints=constraints,
+                  args=())
+w_mv = res_mv.x
+
+# Equal weight benchmark
+w_eq = w0.copy()
+
+def summary(w, label):
+    return pd.Series({
+        'Return (%)':     round(port_ret(w)*100, 2),
+        'Volatility (%)': round(port_vol(w)*100, 2),
+        'Sharpe':         round((port_ret(w)-RF)/port_vol(w), 3)
+    }, name=label)
+
+result = pd.concat([
+    summary(w_bl, 'BL Max Sharpe'),
+    summary(w_mv, 'BL Min Variance'),
+    summary(w_eq, 'Equal Weight')
+], axis=1).T
+
+print(result)
+# Portfolio weights — pie chart for BL Max Sharpe
+w_df = pd.DataFrame({
+    'BL Max Sharpe':    (w_bl * 100).round(1),
+    'BL Min Variance':  (w_mv * 100).round(1),
+    'Equal Weight':     (w_eq * 100).round(1)
+}, index=asset_names)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 6))
+palette = sns.color_palette('husl', n)
+
+for ax, col in zip(axes, w_df.columns):
+    weights = w_df[col]
+    non_zero = weights[weights > 0.1]
+    wedges, texts, autotexts = ax.pie(
+        non_zero, labels=non_zero.index,
+        autopct='%1.1f%%', startangle=90,
+        colors=palette[:len(non_zero)],
+        pctdistance=0.8
+    )
+    for t in autotexts: t.set_fontsize(8)
+    for t in texts: t.set_fontsize(8)
+    ax.set_title(col, fontsize=12, fontweight='bold')
+
+plt.suptitle('Portfolio Allocation Comparison', fontsize=14, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig('portfolio_allocation.png', dpi=150)
+plt.show()
+
+print('\nWeights table (%):')
+print(w_df)
+## 8. Efficient Frontier — BL vs Historical Markowitz
+N_SIM = 8000
+np.random.seed(42)
+
+sim_vols_bl, sim_rets_bl, sim_sr_bl = [], [], []
+sim_vols_mk, sim_rets_mk, sim_sr_mk = [], [], []
+
+for _ in range(N_SIM):
+    w = np.random.dirichlet(np.ones(n))
+    
+    # BL
+    r_bl  = w @ mu_BL
+    v_bl  = np.sqrt(w @ Sigma_np @ w)
+    sim_rets_bl.append(r_bl)
+    sim_vols_bl.append(v_bl)
+    sim_sr_bl.append((r_bl - RF) / v_bl)
+    
+    # Historical Markowitz
+    r_mk  = w @ mu_hist.values
+    v_mk  = np.sqrt(w @ Sigma_np @ w)  # same covariance
+    sim_rets_mk.append(r_mk)
+    sim_vols_mk.append(v_mk)
+    sim_sr_mk.append((r_mk - RF) / v_mk)
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+for ax, vols, rets, srs, title in [
+    (axes[0], sim_vols_bl, sim_rets_bl, sim_sr_bl, 'Black-Litterman Efficient Frontier'),
+    (axes[1], sim_vols_mk, sim_rets_mk, sim_sr_mk, 'Historical Markowitz Efficient Frontier')
+]:
+    sc = ax.scatter(np.array(vols)*100, np.array(rets)*100,
+                    c=srs, cmap='plasma', alpha=0.3, s=5)
+    plt.colorbar(sc, ax=ax, label='Sharpe Ratio')
+    ax.set_xlabel('Volatility (%)')
+    ax.set_ylabel('Return (%)')
+    ax.set_title(title, fontweight='bold')
+
+# Mark BL optimal on left chart
+axes[0].scatter(port_vol(w_bl)*100, port_ret(w_bl)*100,
+                marker='*', color='gold', s=300, zorder=5,
+                edgecolors='black', label='BL Max Sharpe')
+axes[0].legend()
+
+plt.suptitle('BL vs Markowitz: Frontier Comparison', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('frontier_comparison.png', dpi=150)
+plt.show()
+## 9. Value-at-Risk & CVaR — BL Optimal Portfolio
+from scipy.stats import norm
+
+PORTFOLIO_VALUE = 100_000
+port_returns_daily = returns @ w_bl
+
+print('=== Value-at-Risk Analysis — BL Max Sharpe Portfolio ===')
+print(f'Portfolio Value: €{PORTFOLIO_VALUE:,}\n')
+
+var_results = []
+for cl in [0.95, 0.99]:
+    alpha = 1 - cl
+    
+    # Parametric
+    z = norm.ppf(alpha)
+    var_param = -(port_returns_daily.mean() + z * port_returns_daily.std()) * PORTFOLIO_VALUE
+    
+    # Historical
+    var_hist  = -np.percentile(port_returns_daily, alpha*100) * PORTFOLIO_VALUE
+    
+    # CVaR
+    thr = np.percentile(port_returns_daily, alpha*100)
+    cvar = -port_returns_daily[port_returns_daily <= thr].mean() * PORTFOLIO_VALUE
+    
+    var_results.append({
+        'Confidence': f'{int(cl*100)}%',
+        'Param VaR (€)':  round(var_param),
+        'Hist VaR (€)':   round(var_hist),
+        'CVaR (€)':       round(cvar)
+    })
+    print(f'{int(cl*100)}% | Parametric VaR: €{var_param:,.0f} | Historical VaR: €{var_hist:,.0f} | CVaR: €{cvar:,.0f}')
+
+var_df = pd.DataFrame(var_results).set_index('Confidence')
+print('\n', var_df)
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.hist(port_returns_daily * 100, bins=80, color='#3498db',
+        alpha=0.7, edgecolor='white', linewidth=0.3)
+
+for cl, color in [(0.95, 'orange'), (0.99, 'red')]:
+    v = np.percentile(port_returns_daily, (1-cl)*100) * 100
+    ax.axvline(v, color=color, linestyle='--', linewidth=2,
+               label=f'VaR {int(cl*100)}% = {v:.2f}%')
+
+ax.set_xlabel('Daily Return (%)')
+ax.set_ylabel('Frequency')
+ax.set_title('BL Portfolio — Return Distribution & VaR', fontsize=13, fontweight='bold')
+ax.legend()
+plt.tight_layout()
+plt.savefig('bl_var.png', dpi=150)
+plt.show()
+## 10. View Sensitivity Analysis
+How sensitive is the optimal allocation to changes in individual view confidence?
+tau_range = np.linspace(0.01, 0.25, 20)
+sensitivity = []
+
+for t in tau_range:
+    Om_t = np.diag([t * (P[i] @ Sigma_np @ P[i]) for i in range(k)])
+    tSig_inv = np.linalg.inv(t * Sigma_np)
+    Om_inv_t = np.linalg.inv(Om_t)
+    mu_t = np.linalg.inv(tSig_inv + P.T @ Om_inv_t @ P) @ (tSig_inv @ Pi + P.T @ Om_inv_t @ Q)
+    sensitivity.append(mu_t * 100)
+
+sens_df = pd.DataFrame(sensitivity, columns=asset_names, index=tau_range)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+for col in sens_df.columns:
+    ax.plot(tau_range, sens_df[col], label=col, linewidth=2)
+
+ax.axvline(0.075, color='white', linestyle=':', linewidth=1.5, label='Base tau=0.075')
+ax.set_xlabel('Tau (uncertainty in prior)', fontsize=11)
+ax.set_ylabel('BL Expected Return (%)', fontsize=11)
+ax.set_title('Sensitivity of BL Returns to Prior Uncertainty (tau)', fontsize=13, fontweight='bold')
+ax.legend(loc='upper right', fontsize=8, ncol=2)
+plt.tight_layout()
+plt.savefig('sensitivity_tau.png', dpi=150)
+plt.show()
+## 11. Summary & Investment Conclusions
+
+### Model Architecture
+This portfolio is built on three pillars:
+1. **Market equilibrium** (prior): avoids extreme Markowitz concentration
+2. **Active macro views** (from Market Insight letter): translates qualitative views into quantitative signals
+3. **Optimisation with constraints**: max 25% per asset enforces genuine diversification
+
+### Views Implemented
+| View | Rationale from Letter |
+|---|---|
+| India > Japan +3% | Young demographics, digitalization, long-term structural growth |
+| Healthcare > World Quality +2% | Indirect AI beneficiary, drug discovery acceleration |
+| Euro IG > US Treasuries +1.5% | Overweight euro duration, IG over HY |
+| Infrastructure absolute +8% | AI energy capex, real assets structural demand |
+
+### Key Limitations
+- Views are subjective — model output is only as good as the macro analysis
+- Omega calibration (view uncertainty) significantly affects results
+- Historical covariance may not capture regime changes
+- No transaction costs or liquidity constraints modelled
+
+### Possible Extensions
+- Dynamic BL with rolling window views
+- GARCH-DCC for time-varying covariance
+- Risk parity as alternative weighting scheme
+- Factor attribution (Fama-French, Barra)
+
+---
+*Project by Angelo Bruni — [Market Insight on Medium](https://medium.com/@angelobruni60) | [LinkedIn](https://www.linkedin.com/in/angelobruni)*
